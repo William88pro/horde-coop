@@ -1,0 +1,208 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>Horde Co-op</title>
+<style>
+  html,body{margin:0;height:100%;background:#0b0e14;overflow:hidden;font-family:system-ui,Segoe UI,sans-serif;color:#fff}
+  canvas{display:block;width:100%;height:100%;cursor:crosshair}
+  #menu{position:fixed;inset:0;display:flex;align-items:center;justify-content:center;background:rgba(5,8,14,.94);z-index:5}
+  .box{background:#141a26;border:1px solid #2a3550;border-radius:14px;padding:28px 32px;width:320px;text-align:center}
+  h1{margin:0 0 4px;font-size:28px;letter-spacing:1px}
+  .sub{color:#8a97b5;font-size:13px;margin-bottom:18px}
+  input{width:100%;box-sizing:border-box;margin:6px 0;padding:10px 12px;border-radius:8px;border:1px solid #2a3550;background:#0b0e14;color:#fff;font-size:15px}
+  button{width:100%;margin-top:10px;padding:12px;border:0;border-radius:8px;background:#3e63dd;color:#fff;font-size:16px;font-weight:600;cursor:pointer}
+  button:hover{background:#5472e4}
+  #msg{color:#ff7b72;font-size:13px;min-height:18px;margin-top:8px}
+  .help{color:#8a97b5;font-size:12px;margin-top:14px;line-height:1.5}
+</style>
+</head>
+<body>
+<canvas id="c"></canvas>
+
+<div id="menu">
+  <div class="box">
+    <h1>HORDE CO-OP</h1>
+    <div class="sub">Survis aux vagues avec jusqu'à 3 amis</div>
+    <input id="name" maxlength="12" placeholder="Ton pseudo">
+    <input id="room" maxlength="8" placeholder="Code du salon (vide = salon public)">
+    <button id="play">Jouer</button>
+    <div id="msg"></div>
+    <div class="help">ZQSD / WASD / flèches : bouger<br>Souris : viser — Clic maintenu : tirer<br>Envoie le même code à tes amis pour jouer ensemble</div>
+  </div>
+</div>
+
+<script>
+// ====== CONFIG ======
+// Mets ici l'adresse de ton serveur déployé (ex: 'wss://horde-coop.onrender.com')
+// Laisse vide si le jeu est servi par le serveur lui-même.
+const PROD_URL = '';
+// ====================
+
+const W = 1600, H = 900;
+const cv = document.getElementById('c'), ctx = cv.getContext('2d');
+const menu = document.getElementById('menu'), msg = document.getElementById('msg');
+const nameIn = document.getElementById('name'), roomIn = document.getElementById('room');
+nameIn.value = localStorage.getItem('hc_name') || '';
+
+let ws = null, myId = null, roomCode = '', snap = null, connected = false;
+const disp = { p: new Map(), e: new Map(), b: new Map() };
+const COLORS = ['#3e9bff', '#3ddc84', '#ffb224', '#ff6bd6'];
+const ECOL = { g: '#e5484d', f: '#ffb224', t: '#8e4ec6' };
+const ERAD = { g: 14, f: 10, t: 24 };
+
+function wsUrl() {
+  const h = location.hostname;
+  if (location.protocol === 'file:') return PROD_URL || 'ws://localhost:8080';
+  if (h === 'localhost' || h === '127.0.0.1') return 'ws://' + location.host;
+  if (PROD_URL) return PROD_URL;
+  return (location.protocol === 'https:' ? 'wss://' : 'ws://') + location.host;
+}
+
+function connect() {
+  const name = nameIn.value.trim() || 'Joueur';
+  localStorage.setItem('hc_name', name);
+  msg.textContent = 'Connexion…';
+  try { ws = new WebSocket(wsUrl()); } catch (e) { msg.textContent = 'Adresse serveur invalide'; return; }
+  ws.onopen = () => ws.send(JSON.stringify({ t: 'join', name, room: roomIn.value.trim() }));
+  ws.onmessage = (ev) => {
+    const m = JSON.parse(ev.data);
+    if (m.t === 'hello') { myId = m.id; roomCode = m.room; connected = true; menu.style.display = 'none'; }
+    else if (m.t === 'err') { msg.textContent = m.msg; ws.close(); }
+    else if (m.t === 's') { snap = m; applySnap(m); }
+  };
+  ws.onclose = () => {
+    if (connected) { connected = false; menu.style.display = 'flex'; msg.textContent = 'Connexion perdue'; }
+    else if (!msg.textContent || msg.textContent === 'Connexion…') msg.textContent = 'Serveur injoignable';
+  };
+}
+document.getElementById('play').onclick = connect;
+[nameIn, roomIn].forEach((i) => i.addEventListener('keydown', (e) => { if (e.key === 'Enter') connect(); }));
+
+function sync(map, list, mk) {
+  const seen = new Set();
+  for (const a of list) {
+    const id = a[0]; seen.add(id);
+    const t = mk(a);
+    let d = map.get(id);
+    if (!d) { d = { x: t.x, y: t.y }; map.set(id, d); }
+    Object.assign(d, t.extra); d.tx = t.x; d.ty = t.y;
+  }
+  for (const id of map.keys()) if (!seen.has(id)) map.delete(id);
+}
+function applySnap(m) {
+  sync(disp.p, m.p, (a) => ({ x: a[1], y: a[2], extra: { id: a[0], ang: a[3], hp: a[4], alive: a[5], score: a[6], name: a[7] } }));
+  sync(disp.e, m.e, (a) => ({ x: a[2], y: a[3], extra: { type: a[1] } }));
+  sync(disp.b, m.b, (a) => ({ x: a[1], y: a[2], extra: {} }));
+}
+
+// ====== Entrées ======
+const keys = new Set();
+let mouseX = 0, mouseY = 0, shooting = false;
+addEventListener('keydown', (e) => { if (document.activeElement.tagName !== 'INPUT') keys.add(e.key.toLowerCase()); });
+addEventListener('keyup', (e) => keys.delete(e.key.toLowerCase()));
+cv.addEventListener('mousemove', (e) => { mouseX = e.clientX; mouseY = e.clientY; });
+cv.addEventListener('mousedown', (e) => { if (e.button === 0) shooting = true; mouseX = e.clientX; mouseY = e.clientY; });
+addEventListener('mouseup', () => (shooting = false));
+cv.addEventListener('contextmenu', (e) => e.preventDefault());
+
+let scale = 1, offX = 0, offY = 0, dpr = 1;
+function resize() {
+  dpr = window.devicePixelRatio || 1;
+  cv.width = innerWidth * dpr; cv.height = innerHeight * dpr;
+  scale = Math.min(cv.width / W, cv.height / H);
+  offX = (cv.width - W * scale) / 2; offY = (cv.height - H * scale) / 2;
+}
+addEventListener('resize', resize); resize();
+
+setInterval(() => {
+  if (!connected || !ws || ws.readyState !== 1) return;
+  const L = keys.has('q') || keys.has('a') || keys.has('arrowleft');
+  const R = keys.has('d') || keys.has('arrowright');
+  const U = keys.has('z') || keys.has('w') || keys.has('arrowup');
+  const D = keys.has('s') || keys.has('arrowdown');
+  const me = disp.p.get(myId);
+  let ang = 0;
+  if (me) {
+    const ax = ((mouseX * dpr) - offX) / scale, ay = ((mouseY * dpr) - offY) / scale;
+    ang = Math.atan2(ay - me.y, ax - me.x);
+  }
+  ws.send(JSON.stringify({ t: 'in', mx: (R ? 1 : 0) - (L ? 1 : 0), my: (D ? 1 : 0) - (U ? 1 : 0), ang, sh: shooting }));
+}, 33);
+
+// ====== Rendu ======
+let last = performance.now();
+function frame(now) {
+  const dt = Math.min(0.05, (now - last) / 1000); last = now;
+  const k = Math.min(1, dt * 20);
+  for (const map of [disp.p, disp.e, disp.b]) for (const d of map.values()) { d.x += (d.tx - d.x) * k; d.y += (d.ty - d.y) * k; }
+  draw();
+  requestAnimationFrame(frame);
+}
+requestAnimationFrame(frame);
+
+function draw() {
+  ctx.setTransform(1, 0, 0, 1, 0, 0);
+  ctx.fillStyle = '#0b0e14'; ctx.fillRect(0, 0, cv.width, cv.height);
+  ctx.setTransform(scale, 0, 0, scale, offX, offY);
+  ctx.fillStyle = '#10151f'; ctx.fillRect(0, 0, W, H);
+  ctx.strokeStyle = '#1a2233'; ctx.lineWidth = 1;
+  ctx.beginPath();
+  for (let x = 0; x <= W; x += 100) { ctx.moveTo(x, 0); ctx.lineTo(x, H); }
+  for (let y = 0; y <= H; y += 100) { ctx.moveTo(0, y); ctx.lineTo(W, y); }
+  ctx.stroke();
+  ctx.strokeStyle = '#3a4a70'; ctx.lineWidth = 4; ctx.strokeRect(0, 0, W, H);
+  if (!snap) return;
+
+  // Ennemis
+  for (const e of disp.e.values()) {
+    ctx.fillStyle = ECOL[e.type]; ctx.beginPath(); ctx.arc(e.x, e.y, ERAD[e.type], 0, 7); ctx.fill();
+    ctx.strokeStyle = 'rgba(0,0,0,.35)'; ctx.lineWidth = 2; ctx.stroke();
+  }
+  // Balles
+  ctx.fillStyle = '#fff3a3';
+  for (const b of disp.b.values()) { ctx.beginPath(); ctx.arc(b.x, b.y, 4, 0, 7); ctx.fill(); }
+  // Joueurs
+  for (const p of disp.p.values()) {
+    const col = COLORS[p.id % 4];
+    ctx.globalAlpha = p.alive ? 1 : 0.3;
+    ctx.save(); ctx.translate(p.x, p.y); ctx.rotate(p.ang);
+    ctx.fillStyle = '#222'; ctx.fillRect(8, -4, 18, 8);
+    ctx.restore();
+    ctx.fillStyle = col; ctx.beginPath(); ctx.arc(p.x, p.y, 16, 0, 7); ctx.fill();
+    if (p.id === myId) { ctx.strokeStyle = '#fff'; ctx.lineWidth = 3; ctx.stroke(); }
+    ctx.fillStyle = '#fff'; ctx.font = '13px system-ui'; ctx.textAlign = 'center';
+    ctx.fillText(p.name, p.x, p.y - 28);
+    ctx.fillStyle = '#400'; ctx.fillRect(p.x - 18, p.y + 22, 36, 5);
+    ctx.fillStyle = '#3ddc84'; ctx.fillRect(p.x - 18, p.y + 22, 36 * p.hp / 100, 5);
+    ctx.globalAlpha = 1;
+  }
+
+  // HUD
+  ctx.textAlign = 'left'; ctx.font = 'bold 22px system-ui'; ctx.fillStyle = '#fff';
+  ctx.fillText('Vague ' + snap.w, 20, 34);
+  const players = [...disp.p.values()].sort((a, b) => b.score - a.score);
+  ctx.font = '15px system-ui';
+  players.forEach((p, i) => {
+    ctx.fillStyle = COLORS[p.id % 4];
+    ctx.fillText((p.id === myId ? '▶ ' : '') + p.name + ' — ' + p.score + (p.alive ? '' : ' (à terre)'), 20, 62 + i * 22);
+  });
+  ctx.textAlign = 'right'; ctx.fillStyle = '#8a97b5'; ctx.font = '15px system-ui';
+  ctx.fillText('Salon : ' + roomCode, W - 20, 30);
+
+  ctx.textAlign = 'center'; ctx.fillStyle = '#fff'; ctx.font = 'bold 34px system-ui';
+  if (snap.ph === 'break') ctx.fillText('Vague ' + (snap.w + 1) + ' dans ' + snap.bt + ' s', W / 2, H / 2 - 120);
+  else if (snap.ph === 'over') {
+    ctx.fillStyle = '#ff7b72'; ctx.fillText('GAME OVER — vague ' + snap.w, W / 2, H / 2 - 120);
+    ctx.fillStyle = '#fff'; ctx.font = '20px system-ui'; ctx.fillText('Nouvelle partie dans ' + snap.bt + ' s', W / 2, H / 2 - 85);
+  }
+  const me = disp.p.get(myId);
+  if (me && !me.alive && snap.ph === 'wave') {
+    ctx.font = '20px system-ui'; ctx.fillStyle = '#ffb224';
+    ctx.fillText('Tu es à terre — tu reviens à la fin de la vague', W / 2, H - 40);
+  }
+}
+</script>
+</body>
+</html>
